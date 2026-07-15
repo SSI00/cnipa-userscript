@@ -5,6 +5,9 @@
 // @description  国知局专利信息批量查询：申请人/代理机构/最近缴费人/最近缴费种类/法律状态/案件状态，支持 Excel 上传导出、失败重查
 // @author       CNIPA_Fee_Collector
 // @license      MIT
+// @homepageURL  https://github.com/SSI00/cnipa-userscript
+// @downloadURL  https://github.com/SSI00/cnipa-userscript/raw/refs/heads/main/cnipa_batch_query.user.js
+// @updateURL    https://github.com/SSI00/cnipa-userscript/raw/refs/heads/main/cnipa_batch_query.user.js
 // @match        https://cpquery.cponline.cnipa.gov.cn/chinesepatent/*
 // @run-at       document-start
 // @require      https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js
