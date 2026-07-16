@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CNIPA 专利信息批量查询
 // @namespace    http://tampermonkey.net/
-// @version      1.8
+// @version      1.9
 // @description  国知局专利信息批量查询：申请人/代理机构/最近缴费人/最近缴费种类/法律状态/案件状态，支持 Excel 上传导出、失败重查
 // @author       CNIPA_Fee_Collector
 // @license      MIT
@@ -141,7 +141,8 @@
 
     // ---------- 更新日志（新版本追加到最前面） ----------
     const CHANGELOG = [
-        { version: '1.8', date: '2026-07-15', items: ['修复折叠后白色背景板残留的问题，折叠后只剩标题栏'] },
+        { version: '1.9', date: '2026-07-15', items: ['暂停后可重新上传文件/粘贴，点"开始查询"跑新批次', '新增"重新开始"按钮，整体重跑当前批次', '新增"重置"按钮，回到初始状态但保留登录态', '折叠时禁止打开更新日志，避免被遮挡'] },
+        { version: '1.8', date: '2026-07-15', items: ['修复折叠后白色背景板残留的问题，折叠后只剩标题栏', '新增更新日志浮层（标题栏 ⓘ 图标）'] },
         { version: '1.7', date: '2026-07-15', items: ['按钮体系统一为 3 种样式（主按钮蓝底/次按钮蓝边/文字按钮）', 'tab 切换改为下划线选中样式', '选择文件按钮美化，隐藏浏览器原生样式'] },
         { version: '1.6', date: '2026-07-15', items: ['状态文字单独一行显示，不再换行或撑宽窗口'] },
         { version: '1.5', date: '2026-07-15', items: ['新增暂停/继续功能', '按钮防换行，宽度自适应', '窗口大小可拖拽调整（最小 460×400）', '导出文件名改为 CNIPA查询结果_条数_时间戳.xlsx'] },
@@ -158,7 +159,7 @@
         panel.id = 'cnipa-panel';
         panel.innerHTML = `
             <div id="cnipa-header">
-                <b>CNIPA 专利信息批量查询 v1.8</b>
+                <b>CNIPA 专利信息批量查询 v1.9</b>
                 <span id="cnipa-header-btns">
                     <span id="cnipa-changelog-btn" title="更新日志">ⓘ</span>
                     <span id="cnipa-collapse">—</span>
@@ -191,8 +192,10 @@
                 <div class="btn-row">
                     <button id="cnipa-start" class="btn btn-primary">开始查询</button>
                     <button id="cnipa-pause" class="btn" disabled>暂停</button>
+                    <button id="cnipa-restart" class="btn" disabled>重新开始</button>
                     <button id="cnipa-retry-failed" class="btn" disabled>重查失败项</button>
                     <button id="cnipa-export" class="btn btn-primary" disabled>导出 Excel</button>
+                    <button id="cnipa-reset" class="btn">重置</button>
                 </div>
                 <div id="cnipa-status"></div>
                 <div id="cnipa-progress"><div id="cnipa-progress-bar"></div></div>
@@ -602,12 +605,19 @@
 
         document.getElementById('cnipa-start').onclick = startQuery;
         document.getElementById('cnipa-pause').onclick = togglePause;
+        document.getElementById('cnipa-restart').onclick = restartQuery;
         document.getElementById('cnipa-retry-failed').onclick = retryFailed;
         document.getElementById('cnipa-export').onclick = () => exportExcel(getSelectedFields());
+        document.getElementById('cnipa-reset').onclick = resetPanel;
 
-        // 更新日志浮层
+        // 更新日志浮层（折叠时禁止打开）
         const overlay = document.getElementById('cnipa-changelog-overlay');
         document.getElementById('cnipa-changelog-btn').onclick = () => {
+            const body = document.getElementById('cnipa-body');
+            if (body.style.display === 'none') {
+                alert('面板已折叠，请先点击右上角 + 展开面板');
+                return;
+            }
             const list = document.getElementById('cnipa-changelog-list');
             list.innerHTML = CHANGELOG.map(v =>
                 `<div class="cl-version">v${v.version}<span class="cl-date">${v.date}</span></div><ul>` +
@@ -638,7 +648,10 @@
         // 导出：查询中且未暂停（正在跑，数据在变）时禁用；暂停或未在查询且有数据时可用
         document.getElementById('cnipa-export').disabled = !hasRows || (state.running && !state.paused);
         document.getElementById('cnipa-retry-failed').disabled = !hasFailed || state.running;
-        document.getElementById('cnipa-start').disabled = state.running;
+        // 开始查询：运行中且未暂停时禁用；暂停时可用（点它会停止旧任务跑新批次）
+        document.getElementById('cnipa-start').disabled = state.running && !state.paused;
+        // 重新开始：有数据且（未在跑 或 已暂停）时可用
+        document.getElementById('cnipa-restart').disabled = !hasRows || (state.running && !state.paused);
         // 暂停按钮：查询中可用，否则置灰；非查询中恢复"暂停"文字
         const pauseBtn = document.getElementById('cnipa-pause');
         pauseBtn.disabled = !state.running;
@@ -700,7 +713,15 @@
 
     // ---------- 开始查询 ----------
     async function startQuery() {
-        if (state.running) return;
+        // 运行中且未暂停：不允许；暂停中：停止旧任务，用当前输入源重新开始
+        if (state.running && !state.paused) return;
+        if (state.running && state.paused) {
+            // 停止旧任务
+            state.running = false;
+            state.paused = false;
+            // 等旧 runBatch 循环退出
+            await new Promise(r => setTimeout(r, 300));
+        }
         const fields = getSelectedFields();
         if (!fields.length) { alert('请至少勾选一个查询字段'); return; }
         if (!window.__cnipaAuth.token) {
@@ -737,6 +758,60 @@
         // 只处理状态为 pending 的（skip 的格式错误行不查）
         const toProcess = state.rows.filter(r => r.status === 'pending');
         await runBatch(toProcess, fields);
+    }
+
+    // ---------- 重新开始（整体重来当前批次） ----------
+    async function restartQuery() {
+        if (state.running && !state.paused) return;
+        if (!state.rows.length) { alert('没有可重新开始的任务'); return; }
+        // 停止当前任务
+        if (state.running) {
+            state.running = false;
+            state.paused = false;
+            await new Promise(r => setTimeout(r, 300));
+        }
+        const fields = getSelectedFields();
+        if (!fields.length) { alert('请至少勾选一个查询字段'); return; }
+        if (!window.__cnipaAuth.token) {
+            alert('还没有获取到登录态！\n\n请先在页面上手动搜索一次。');
+            return;
+        }
+        // 重置所有行为 pending（skip 的格式错误行保持 skip）
+        state.rows.forEach(r => {
+            if (r.status !== 'skip') {
+                r.status = 'pending';
+                r.results = {};
+                r.note = '';
+            }
+        });
+        const toProcess = state.rows.filter(r => r.status === 'pending');
+        await runBatch(toProcess, fields);
+    }
+
+    // ---------- 重置面板（保留登录态） ----------
+    function resetPanel() {
+        if (state.running && !state.paused) {
+            if (!confirm('正在查询中，确定要重置吗？当前进度将丢失。')) return;
+        }
+        // 停止任务
+        state.running = false;
+        state.paused = false;
+        // 清空数据
+        state.rows = [];
+        // 清空输入
+        document.getElementById('cnipa-input').innerText = '';
+        const fileInput = document.getElementById('cnipa-file');
+        fileInput.value = '';
+        const fileInfo = document.getElementById('cnipa-file-info');
+        fileInfo.textContent = '';
+        delete fileInfo.dataset.appnos;
+        // 清空输出和状态
+        document.getElementById('cnipa-output').innerHTML = '';
+        document.getElementById('cnipa-status').textContent = '';
+        document.getElementById('cnipa-progress-bar').style.width = '0';
+        // 恢复按钮
+        updateButtons();
+        document.getElementById('cnipa-status').textContent = '已重置，登录态保留';
     }
 
     // ---------- 重查失败项 ----------
