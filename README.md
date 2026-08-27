@@ -50,7 +50,11 @@
 
 ## 更新
 
-脚本已配置自动更新，Tampermonkey 会定期检查新版本并提示。也可以点面板标题栏的 ⓘ 图标查看更新日志。
+当前版本：**v1.11**
+
+脚本已配置自动更新，Tampermonkey 会按自身更新检查周期检查新版本并提示。也可以点面板标题栏的 ⓘ 图标查看更新日志。
+
+版本发布记录见：[GitHub Releases](https://github.com/SSI00/cnipa-userscript/releases)
 
 ## 常见问题
 
