@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CNIPA 专利信息批量查询
 // @namespace    http://tampermonkey.net/
-// @version      1.9
+// @version      1.10
 // @description  国知局专利信息批量查询：申请人/代理机构/最近缴费人/最近缴费种类/法律状态/案件状态，支持 Excel 上传导出、失败重查
 // @author       CNIPA_Fee_Collector
 // @license      MIT
@@ -139,8 +139,37 @@
         fyxx: '/api/view/gn/fyxx'
     };
 
+    // ---------- 请求节流与临时风控冷却 ----------
+    const API_REQUEST_INTERVAL_MS = 1200;
+    const API_REQUEST_BATCH_SIZE = 15;
+    const API_REQUEST_BATCH_COOLDOWN_MS = 20000;
+    const WAF_COOLDOWN_MS = 45000;
+    const WAF_MAX_RETRIES = 3;
+    let apiRequestCount = 0;
+    let lastApiRequestAt = 0;
+
+    function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function waitForApiSlot() {
+        if (apiRequestCount >= API_REQUEST_BATCH_SIZE) {
+            await sleep(API_REQUEST_BATCH_COOLDOWN_MS);
+            apiRequestCount = 0;
+        }
+        const intervalWait = API_REQUEST_INTERVAL_MS - (Date.now() - lastApiRequestAt);
+        if (intervalWait > 0) await sleep(intervalWait);
+        lastApiRequestAt = Date.now();
+        apiRequestCount += 1;
+    }
+
+    function isWafLikeStatus(status) {
+        return status === 400 || status === 403 || status === 412 || status === 429;
+    }
+
     // ---------- 更新日志（新版本追加到最前面） ----------
     const CHANGELOG = [
+        { version: '1.10', date: '2026-08-27', items: ['新增接口请求节流和分批冷却，降低连续触发临时风控的概率', 'HTTP 400 非 JSON 时自动冷却并重试，恢复后继续抓取，无需人工刷新页面'] },
         { version: '1.9', date: '2026-07-15', items: ['暂停后可重新上传文件/粘贴，点"开始查询"跑新批次', '新增"重新开始"按钮，整体重跑当前批次', '新增"重置"按钮，回到初始状态但保留登录态', '折叠时禁止打开更新日志，避免被遮挡'] },
         { version: '1.8', date: '2026-07-15', items: ['修复折叠后白色背景板残留的问题，折叠后只剩标题栏', '新增更新日志浮层（标题栏 ⓘ 图标）'] },
         { version: '1.7', date: '2026-07-15', items: ['按钮体系统一为 3 种样式（主按钮蓝底/次按钮蓝边/文字按钮）', 'tab 切换改为下划线选中样式', '选择文件按钮美化，隐藏浏览器原生样式'] },
@@ -491,6 +520,7 @@
         const auth = window.__cnipaAuth;
         if (!auth.token) throw new Error('no-auth');
         try {
+            await waitForApiSlot();
             const resp = await fetch(APIS[apiKey], {
                 method: 'POST',
                 headers: {
@@ -509,18 +539,18 @@
             }
             let data;
             try { data = JSON.parse(text); } catch (e) {
-                if (retryCount === 0) {
-                    await new Promise(r => setTimeout(r, 800));
-                    return callApi(apiKey, appNo, retryCount + 1);
-                }
-                throw new Error(`HTTP ${resp.status} 非JSON`);
+                const error = new Error(`HTTP ${resp.status} 非JSON`);
+                error.isWaf = isWafLikeStatus(resp.status) || !(resp.headers.get('content-type') || '').toLowerCase().includes('json');
+                error.httpStatus = resp.status;
+                throw error;
             }
             if (data.code !== 200) throw new Error(`code=${data.code}`);
             return data;
         } catch (e) {
             if (e.message === 'auth-expired' || e.message === 'no-auth') throw e;
+            if (e.isWaf) throw e;
             if (retryCount === 0) {
-                await new Promise(r => setTimeout(r, 800));
+                await sleep(1500);
                 return callApi(apiKey, appNo, retryCount + 1);
             }
             throw e;
@@ -671,6 +701,7 @@
 
         const total = rowsToProcess.length;
         let stopped = false;
+        let consecutiveWafErrors = 0;
         for (let i = 0; i < total; i++) {
             if (stopped) break;
             // 暂停检查：暂停时在此等待，直到继续
@@ -684,6 +715,7 @@
                 await processRow(row, fields);
                 row.status = 'ok';
                 row.note = '';
+                consecutiveWafErrors = 0;
             } catch (e) {
                 if (e.message === 'auth-expired' || e.message === 'no-auth') {
                     row.status = 'fail';
@@ -691,9 +723,18 @@
                     statusEl.textContent = '登录态过期，已停止';
                     alert('登录态已过期！\n\n请在页面上重新搜索一次，然后重新开始查询。');
                     stopped = true;
+                } else if (e.isWaf && consecutiveWafErrors < WAF_MAX_RETRIES) {
+                    consecutiveWafErrors += 1;
+                    const cooldownMs = WAF_COOLDOWN_MS * Math.min(consecutiveWafErrors, 3);
+                    row.status = 'pending';
+                    row.note = '临时风控，等待后自动重试';
+                    statusEl.textContent = `接口临时风控，等待 ${Math.ceil(cooldownMs / 1000)} 秒后自动重试当前申请号`;
+                    await sleep(cooldownMs);
+                    i -= 1;
                 } else {
                     row.status = 'fail';
                     row.note = e.message;
+                    consecutiveWafErrors = 0;
                 }
             }
             bar.style.width = ((i + 1) / total * 100) + '%';
@@ -703,7 +744,7 @@
             renderOutput(fields);
             // 只有用户本来就在底部时才跟随滚动，否则保持用户当前位置
             if (wasAtBottom) wrap.scrollTop = wrap.scrollHeight;
-            await new Promise(r => setTimeout(r, 400));
+            await sleep(400);
         }
 
         if (!stopped) statusEl.textContent = `完成 ${total} 条`;
