@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         CNIPA 专利信息批量查询
 // @namespace    http://tampermonkey.net/
-// @version      1.11
-// @description  国知局专利信息批量查询：申请人/代理机构/最近缴费人/最近缴费种类/法律状态/案件状态，支持 Excel 上传导出、失败重查
+// @version      1.12
+// @description  国知局专利信息批量查询：申请人/代理机构/最近缴费人/最近缴费种类/最近缴费金额/最近缴费日期/法律状态/案件状态，支持 Excel 上传导出、失败重查
 // @author       CNIPA_Fee_Collector
 // @license      MIT
 // @homepageURL  https://github.com/SSI00/cnipa-userscript
@@ -102,6 +102,24 @@
                 return (list && list.length) ? (list[0].yijiaofjfzlmc || '').trim() : '';
             }
         },
+        feeAmount: {
+            label: '最近缴费金额',
+            api: 'fyxx',
+            extract(data) {
+                const list = data.data && data.data.yijiaofei && data.data.yijiaofei.svYijfList;
+                if (!list || !list.length) return '';
+                const value = list[0].yijiaofjfje;
+                return value == null ? '' : String(value).trim();
+            }
+        },
+        feeDate: {
+            label: '最近缴费日期',
+            api: 'fyxx',
+            extract(data) {
+                const list = data.data && data.data.yijiaofei && data.data.yijiaofei.svYijfList;
+                return (list && list.length) ? String(list[0].yijiaofjfrq || '').trim() : '';
+            }
+        },
         legalStatus: {
             label: '法律状态',
             api: 'sqxx',
@@ -123,7 +141,7 @@
             }
         }
     };
-    const FIELD_ORDER_DEFAULT = ['applicant', 'agency', 'payer', 'feeType', 'legalStatus', 'caseStatus'];
+    const FIELD_ORDER_DEFAULT = ['applicant', 'agency', 'payer', 'feeType', 'feeAmount', 'feeDate', 'legalStatus', 'caseStatus'];
 
     // ---------- 全局状态 ----------
     const state = {
@@ -169,6 +187,7 @@
 
     // ---------- 更新日志（新版本追加到最前面） ----------
     const CHANGELOG = [
+        { version: '1.12', date: '2026-08-28', items: ['新增最近缴费金额和最近缴费日期查询字段，并支持结果预览和 Excel 导出'] },
         { version: '1.11', date: '2026-08-27', items: ['去掉查询窗口最外围边框，保留内部白色背景、圆角和阴影'] },
         { version: '1.10', date: '2026-08-27', items: ['新增接口请求节流和分批冷却，降低连续触发临时风控的概率', 'HTTP 400 非 JSON 时自动冷却并重试，恢复后继续抓取，无需人工刷新页面'] },
         { version: '1.9', date: '2026-07-15', items: ['暂停后可重新上传文件/粘贴，点"开始查询"跑新批次', '新增"重新开始"按钮，整体重跑当前批次', '新增"重置"按钮，回到初始状态但保留登录态', '折叠时禁止打开更新日志，避免被遮挡'] },
@@ -189,7 +208,7 @@
         panel.id = 'cnipa-panel';
         panel.innerHTML = `
             <div id="cnipa-header">
-                <b>CNIPA 专利信息批量查询 v1.11</b>
+                <b>CNIPA 专利信息批量查询 v1.12</b>
                 <span id="cnipa-header-btns">
                     <span id="cnipa-changelog-btn" title="更新日志">ⓘ</span>
                     <span id="cnipa-collapse">—</span>
