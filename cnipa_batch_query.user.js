@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CNIPA 专利信息批量查询
 // @namespace    http://tampermonkey.net/
-// @version      1.12
+// @version      1.13
 // @description  国知局专利信息批量查询：申请人/代理机构/最近缴费人/最近缴费种类/最近缴费金额/最近缴费日期/法律状态/案件状态，支持 Excel 上传导出、失败重查
 // @author       CNIPA_Fee_Collector
 // @license      MIT
@@ -161,8 +161,9 @@
     const API_REQUEST_INTERVAL_MS = 1200;
     const API_REQUEST_BATCH_SIZE = 15;
     const API_REQUEST_BATCH_COOLDOWN_MS = 20000;
-    const WAF_COOLDOWN_MS = 45000;
-    const WAF_MAX_RETRIES = 3;
+    const WAF_RETRY_WAIT_MS = 45000;
+    const WAF_SKIP_WAIT_MS = 30000;
+    const WAF_MAX_ROUNDS = 2;
     let apiRequestCount = 0;
     let lastApiRequestAt = 0;
 
@@ -187,6 +188,7 @@
 
     // ---------- 更新日志（新版本追加到最前面） ----------
     const CHANGELOG = [
+        { version: '1.13', date: '2026-08-28', items: ['调整临时风控处理：单号首次等待45秒重试，仍失败等待30秒后跳过；本轮完成后自动进行第二遍重查，第二遍仍失败则保留失败项'] },
         { version: '1.12', date: '2026-08-28', items: ['新增最近缴费金额和最近缴费日期查询字段，并支持结果预览和 Excel 导出'] },
         { version: '1.11', date: '2026-08-27', items: ['去掉查询窗口最外围边框，保留内部白色背景、圆角和阴影'] },
         { version: '1.10', date: '2026-08-27', items: ['新增接口请求节流和分批冷却，降低连续触发临时风控的概率', 'HTTP 400 非 JSON 时自动冷却并重试，恢复后继续抓取，无需人工刷新页面'] },
@@ -208,7 +210,7 @@
         panel.id = 'cnipa-panel';
         panel.innerHTML = `
             <div id="cnipa-header">
-                <b>CNIPA 专利信息批量查询 v1.12</b>
+                <b>CNIPA 专利信息批量查询 v1.13</b>
                 <span id="cnipa-header-btns">
                     <span id="cnipa-changelog-btn" title="更新日志">ⓘ</span>
                     <span id="cnipa-collapse">—</span>
@@ -719,55 +721,135 @@
         updateButtons();
         renderOutput(fields);
 
-        const total = rowsToProcess.length;
-        let stopped = false;
-        let consecutiveWafErrors = 0;
-        for (let i = 0; i < total; i++) {
-            if (stopped) break;
-            // 暂停检查：暂停时在此等待，直到继续
-            while (state.paused && state.running) {
-                await new Promise(r => setTimeout(r, 200));
-            }
-            if (!state.running) break;
-            const row = rowsToProcess[i];
-            statusEl.textContent = `${i + 1}/${total} ${row.cleaned}`;
-            try {
-                await processRow(row, fields);
-                row.status = 'ok';
-                row.note = '';
-                consecutiveWafErrors = 0;
-            } catch (e) {
-                if (e.message === 'auth-expired' || e.message === 'no-auth') {
-                    row.status = 'fail';
-                    row.note = '登录态过期';
-                    statusEl.textContent = '登录态过期，已停止';
-                    alert('登录态已过期！\n\n请在页面上重新搜索一次，然后重新开始查询。');
-                    stopped = true;
-                } else if (e.isWaf && consecutiveWafErrors < WAF_MAX_RETRIES) {
-                    consecutiveWafErrors += 1;
-                    const cooldownMs = WAF_COOLDOWN_MS * Math.min(consecutiveWafErrors, 3);
-                    row.status = 'pending';
-                    row.note = '临时风控，等待后自动重试';
-                    statusEl.textContent = `接口临时风控，等待 ${Math.ceil(cooldownMs / 1000)} 秒后自动重试当前申请号`;
-                    await sleep(cooldownMs);
-                    i -= 1;
-                } else {
-                    row.status = 'fail';
-                    row.note = e.message;
-                    consecutiveWafErrors = 0;
-                }
-            }
-            bar.style.width = ((i + 1) / total * 100) + '%';
+        const renderBatchOutput = () => {
             // 渲染前记录用户是否本来就在底部附近（30px 容差）
             const wrap = document.getElementById('cnipa-output-wrap');
             const wasAtBottom = wrap.scrollTop + wrap.clientHeight >= wrap.scrollHeight - 30;
             renderOutput(fields);
             // 只有用户本来就在底部时才跟随滚动，否则保持用户当前位置
             if (wasAtBottom) wrap.scrollTop = wrap.scrollHeight;
-            await sleep(400);
+        };
+        const isAuthError = e => e.message === 'auth-expired' || e.message === 'no-auth';
+        const stopForAuth = row => {
+            row.status = 'fail';
+            row.note = '登录态过期';
+            statusEl.textContent = '登录态过期，已停止';
+            alert('登录态已过期！\n\n请在页面上重新搜索一次，然后重新开始查询。');
+        };
+        const waitWithCountdown = async (round, row, waitMs, action, skippedCount) => {
+            let remainingMs = waitMs;
+            while (remainingMs > 0 && state.running) {
+                while (state.paused && state.running) {
+                    statusEl.textContent = `已暂停（第${round}遍，${row.cleaned}，剩余 ${Math.ceil(remainingMs / 1000)} 秒）`;
+                    await sleep(200);
+                }
+                if (!state.running) return false;
+                const seconds = Math.ceil(remainingMs / 1000);
+                const skippedText = skippedCount ? `，已跳过 ${skippedCount} 个` : '';
+                statusEl.textContent = `第${round}遍：${row.cleaned} 临时风控，等待 ${seconds} 秒后${action}${skippedText}`;
+                const tickMs = Math.min(1000, remainingMs);
+                await sleep(tickMs);
+                remainingMs -= tickMs;
+            }
+            return state.running;
+        };
+
+        let stopped = false;
+        let round = 1;
+        let roundRows = rowsToProcess.slice();
+        let finalSkipped = [];
+
+        while (round <= WAF_MAX_ROUNDS && roundRows.length && state.running) {
+            const total = roundRows.length;
+            const skippedRows = [];
+            finalSkipped = skippedRows;
+            bar.style.width = '0';
+            statusEl.textContent = `第${round}遍开始，共 ${total} 条`;
+
+            for (let i = 0; i < total; i++) {
+                if (stopped) break;
+                // 暂停检查：暂停时在此等待，直到继续
+                while (state.paused && state.running) {
+                    await sleep(200);
+                }
+                if (!state.running) break;
+
+                const row = roundRows[i];
+                statusEl.textContent = `第${round}遍 ${i + 1}/${total} ${row.cleaned}`;
+                try {
+                    await processRow(row, fields);
+                    row.status = 'ok';
+                    row.note = '';
+                } catch (e) {
+                    if (isAuthError(e)) {
+                        stopForAuth(row);
+                        stopped = true;
+                    } else if (e.isWaf) {
+                        row.status = 'pending';
+                        row.note = '临时风控，45秒后自动重试';
+                        const canRetry = await waitWithCountdown(round, row, WAF_RETRY_WAIT_MS, '重试', skippedRows.length);
+                        if (!canRetry) {
+                            stopped = true;
+                        } else {
+                            try {
+                                await processRow(row, fields);
+                                row.status = 'ok';
+                                row.note = '';
+                            } catch (retryError) {
+                                if (isAuthError(retryError)) {
+                                    stopForAuth(row);
+                                    stopped = true;
+                                } else if (retryError.isWaf) {
+                                    skippedRows.push(row);
+                                    row.status = 'pending';
+                                    row.note = round < WAF_MAX_ROUNDS ? '临时风控，已跳过，等待下一遍重查' : '临时风控，第二遍仍失败';
+                                    const canContinue = await waitWithCountdown(round, row, WAF_SKIP_WAIT_MS, '跳过并查找下一个', skippedRows.length);
+                                    if (!canContinue) stopped = true;
+                                } else {
+                                    row.status = 'fail';
+                                    row.note = retryError.message;
+                                }
+                            }
+                        }
+                    } else {
+                        row.status = 'fail';
+                        row.note = e.message;
+                    }
+                }
+
+                bar.style.width = ((i + 1) / total * 100) + '%';
+                renderBatchOutput();
+                if (stopped) break;
+                await sleep(400);
+            }
+
+            if (stopped || !state.running) break;
+            if (skippedRows.length && round < WAF_MAX_ROUNDS) {
+                statusEl.textContent = `第${round}遍完成，跳过 ${skippedRows.length} 个，开始第${round + 1}遍自动重查`;
+                roundRows = skippedRows;
+                round += 1;
+                await sleep(400);
+                continue;
+            }
+            finalSkipped = skippedRows;
+            break;
         }
 
-        if (!stopped) statusEl.textContent = `完成 ${total} 条`;
+        if (!stopped && state.running) {
+            finalSkipped.forEach(row => {
+                row.status = 'fail';
+                row.note = '自动重查两遍仍遇到临时风控';
+            });
+            renderBatchOutput();
+            const failedCount = rowsToProcess.filter(row => row.status === 'fail').length;
+            if (finalSkipped.length) {
+                statusEl.textContent = `自动查询完成，仍有 ${finalSkipped.length} 个申请号失败，请点击“重查失败项”`;
+            } else if (failedCount) {
+                statusEl.textContent = `完成 ${rowsToProcess.length} 条，仍有 ${failedCount} 个失败项，请点击“重查失败项”`;
+            } else {
+                statusEl.textContent = `完成 ${rowsToProcess.length} 条`;
+            }
+        }
         state.running = false;
         updateButtons();
     }
