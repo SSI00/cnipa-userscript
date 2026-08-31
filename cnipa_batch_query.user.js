@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CNIPA 专利信息批量查询
 // @namespace    http://tampermonkey.net/
-// @version      1.14
+// @version      1.15
 // @description  国知局专利信息批量查询：申请人/代理机构/最近缴费人/最近缴费种类/最近缴费金额/最近缴费日期/法律状态/案件状态/应缴费信息/应缴滞纳金信息，支持 Excel 上传导出、失败重查
 // @author       CNIPA_Fee_Collector
 // @license      MIT
@@ -185,6 +185,7 @@
 
     // ---------- 全局状态 ----------
     const state = {
+        queryMode: 'appNo',                       // appNo：按申请号；applicant：按申请人
         fieldOrder: FIELD_ORDER_DEFAULT.slice(),   // 当前字段顺序（含未勾选）
         checked: new Set(FIELD_ORDER_DEFAULT),      // 勾选的字段
         rows: [],   // [{original, cleaned, results:{fieldKey:value}, status:'pending'|'ok'|'fail'|'skip', note}]
@@ -193,6 +194,7 @@
     };
 
     const APIS = {
+        search: '/api/search/undomestic/publicSearch',
         sqxx: '/api/view/gn/sqxx',
         fyxx: '/api/view/gn/fyxx'
     };
@@ -228,6 +230,7 @@
 
     // ---------- 更新日志（新版本追加到最前面） ----------
     const CHANGELOG = [
+        { version: '1.15', date: '2026-08-31', items: ['新增“按申请号查询”和“按申请人查询”模式切换；按申请人查询时先获取该申请人的申请号，再批量抓取勾选字段'] },
         { version: '1.14', date: '2026-08-31', items: ['新增“应缴费信息”和“应缴滞纳金信息”两个可选查询项目，各自抓取第一条，并在结果预览和 Excel 中展开为四列'] },
         { version: '1.13', date: '2026-08-28', items: ['调整临时风控处理：单号首次等待45秒重试，仍失败等待30秒后跳过；本轮完成后自动进行第二遍重查，第二遍仍失败则保留失败项'] },
         { version: '1.12', date: '2026-08-28', items: ['新增最近缴费金额和最近缴费日期查询字段，并支持结果预览和 Excel 导出'] },
@@ -251,7 +254,7 @@
         panel.id = 'cnipa-panel';
         panel.innerHTML = `
             <div id="cnipa-header">
-                <b>CNIPA 专利信息批量查询 v1.14</b>
+                <b>CNIPA 专利信息批量查询 v1.15</b>
                 <span id="cnipa-header-btns">
                     <span id="cnipa-changelog-btn" title="更新日志">ⓘ</span>
                     <span id="cnipa-collapse">—</span>
@@ -260,10 +263,16 @@
             <div id="cnipa-body">
                 <div id="cnipa-auth-status" class="auth-wait">⏳ 等待获取登录态... 请先在页面上<b>手动搜索一次</b></div>
 
+                <div class="section-title">查询模式：</div>
+                <div class="query-mode-tabs">
+                    <button id="mode-appno" class="query-mode-tab active">按申请号查询</button>
+                    <button id="mode-applicant" class="query-mode-tab">按申请人查询</button>
+                </div>
+
                 <div class="section-title">查询字段（勾选 + 拖动排序）：</div>
                 <ul id="cnipa-fields"></ul>
 
-                <div class="section-title">申请号来源：</div>
+                <div id="cnipa-source-title" class="section-title">申请号来源：</div>
                 <div class="input-tabs">
                     <button id="tab-paste" class="tab active">粘贴</button>
                     <button id="tab-upload" class="tab">上传 Excel</button>
@@ -274,7 +283,7 @@
                 <div id="pane-upload" style="display:none;">
                     <div class="upload-row">
                         <button id="cnipa-download-tpl" class="btn-text">下载模板</button>
-                        <span class="hint">模板为 xlsx，A 列填申请号</span>
+                        <span id="cnipa-template-hint" class="hint">模板为 xlsx，A 列填申请号</span>
                     </div>
                     <label for="cnipa-file" class="btn btn-file">选择文件</label>
                     <input type="file" id="cnipa-file" accept=".xlsx" />
@@ -312,6 +321,7 @@
         bindTabs();
         bindDrag();
         bindActions();
+        updateModeUI();
         watchAuth();
     }
 
@@ -361,6 +371,12 @@
         #cnipa-fields li.dragging { opacity:.4; }
         #cnipa-fields li .drag-handle { color:#999; margin-right:8px; cursor:grab; user-select:none; }
         #cnipa-fields li label { flex:1; cursor:pointer; user-select:none; }
+        .query-mode-tabs { display:flex; gap:16px; margin-bottom:8px; border-bottom:1px solid #e0e0e0; }
+        .query-mode-tab { padding:5px 2px; border:none; background:none; cursor:pointer; font-size:13px; color:#666;
+            border-bottom:2px solid transparent; margin-bottom:-1px; transition:color .15s; }
+        .query-mode-tab:hover:not(:disabled) { color:#3664D1; }
+        .query-mode-tab.active { color:#3664D1; border-bottom-color:#3664D1; font-weight:bold; }
+        .query-mode-tab:disabled { color:#aaa; cursor:not-allowed; }
         /* tab 切换：现代下划线选中样式 */
         .input-tabs { display:flex; gap:16px; margin-bottom:8px; border-bottom:1px solid #e0e0e0; }
         .tab { padding:5px 2px; border:none; background:none; cursor:pointer; font-size:13px; color:#666;
@@ -473,6 +489,55 @@
         });
     }
 
+    function getModeSubjectLabel() {
+        return state.queryMode === 'applicant' ? '申请人' : '申请号';
+    }
+
+    function getRowDisplayLabel(row) {
+        return row.cleaned || row.original || row.sourceApplicant || '';
+    }
+
+    function getIdentifierHeaders() {
+        return state.queryMode === 'applicant' ? ['查询申请人', '申请号'] : ['申请号'];
+    }
+
+    function getIdentifierValues(row) {
+        if (state.queryMode === 'applicant') {
+            return [
+                row.sourceApplicant || (row.cleaned ? '' : row.original) || '',
+                row.applicationNo || (row.cleaned ? row.original : '') || ''
+            ];
+        }
+        return [row.original || ''];
+    }
+
+    function updateModeUI() {
+        const isApplicantMode = state.queryMode === 'applicant';
+        document.getElementById('mode-appno').classList.toggle('active', !isApplicantMode);
+        document.getElementById('mode-applicant').classList.toggle('active', isApplicantMode);
+        document.getElementById('cnipa-source-title').textContent = `${getModeSubjectLabel()}来源：`;
+        document.getElementById('cnipa-input').setAttribute(
+            'placeholder',
+            isApplicantMode ? '每行一个申请人名称，例如：华为技术有限公司' : '每行一个申请号，支持 CN202610662164.3 / 202610662164.3 / 2026106621643'
+        );
+        document.getElementById('cnipa-template-hint').textContent = `模板为 xlsx，A 列填${getModeSubjectLabel()}`;
+    }
+
+    function setQueryMode(mode) {
+        if (state.queryMode === mode || state.running) return;
+        if (state.rows.length) {
+            alert('当前已有查询结果，请先导出或点“重置”后再切换查询模式');
+            return;
+        }
+        state.queryMode = mode;
+        const fileInput = document.getElementById('cnipa-file');
+        const fileInfo = document.getElementById('cnipa-file-info');
+        fileInput.value = '';
+        fileInfo.textContent = '';
+        delete fileInfo.dataset.appnos;
+        updateModeUI();
+    }
+
     // ---------- 输入方式切换 ----------
     function bindTabs() {
         const tp = document.getElementById('tab-paste');
@@ -555,7 +620,7 @@
 
     // ---------- 模板下载 ----------
     function downloadTemplate() {
-        const ws = XLSX.utils.aoa_to_sheet([['申请号']]);
+        const ws = XLSX.utils.aoa_to_sheet([[getModeSubjectLabel()]]);
         const wb = XLSX.utils.book_new();
         XLSX.utils.book_append_sheet(wb, ws, 'Sheet1');
         XLSX.writeFile(wb, '查询模板.xlsx');
@@ -586,7 +651,7 @@
     }
 
     // ---------- 调 API（带重试） ----------
-    async function callApi(apiKey, appNo, retryCount = 0) {
+    async function callApi(apiKey, payload, retryCount = 0) {
         const auth = window.__cnipaAuth;
         if (!auth.token) throw new Error('no-auth');
         try {
@@ -599,7 +664,7 @@
                     'Authorization': 'Bearer ' + auth.token,
                     'userType': auth.userType || ''
                 },
-                body: JSON.stringify({ zhuanlisqh: appNo }),
+                body: JSON.stringify(typeof payload === 'string' ? { zhuanlisqh: payload } : payload),
                 credentials: 'include'
             });
             const text = await resp.text();
@@ -625,6 +690,54 @@
             }
             throw e;
         }
+    }
+
+    // ---------- 按申请人搜索申请号 ----------
+    async function searchApplicantRecords(applicant) {
+        const records = [];
+        const pageSize = 50;
+        let page = 1;
+        let total = 0;
+        let pages = 0;
+
+        while (true) {
+            const data = await callApi('search', {
+                page,
+                size: pageSize,
+                sortDataName: '',
+                sortType: '',
+                shenqingrxm: applicant
+            });
+            const result = data.data || {};
+            const pageRecords = Array.isArray(result.records) ? result.records : [];
+            records.push(...pageRecords);
+            total = Number(result.total) || 0;
+            pages = Number(result.pages) || 0;
+
+            if (!pageRecords.length || (pages && page >= pages) || (total && records.length >= total)) break;
+            if (pageRecords.length < pageSize && !total) break;
+            page += 1;
+            if (page > 200) break;
+        }
+        return records;
+    }
+
+    async function waitWithCountdown(round, row, waitMs, action, skippedCount, statusEl) {
+        let remainingMs = waitMs;
+        while (remainingMs > 0 && state.running) {
+            while (state.paused && state.running) {
+                statusEl.textContent = `已暂停（第${round}遍，${getRowDisplayLabel(row)}，剩余 ${Math.ceil(remainingMs / 1000)} 秒）`;
+                await sleep(200);
+            }
+            if (!state.running) return false;
+            const seconds = Math.ceil(remainingMs / 1000);
+            const skippedText = skippedCount ? `，已跳过 ${skippedCount} 个` : '';
+            statusEl.textContent = `第${round}遍：${getRowDisplayLabel(row)} 临时风控，等待 ${seconds} 秒后${action}${skippedText}`;
+            const tickMs = Math.min(1000, remainingMs);
+            await sleep(tickMs);
+            remainingMs -= tickMs;
+        }
+        return state.running;
     }
 
     // ---------- 处理单个申请号 ----------
@@ -662,11 +775,11 @@
     function renderOutput(fields) {
         const table = document.getElementById('cnipa-output');
         const columns = getOutputColumns(fields);
-        const head = ['申请号', ...columns.map(column => column.label), '备注'];
+        const head = [...getIdentifierHeaders(), ...columns.map(column => column.label), '备注'];
         let html = '<thead><tr>' + head.map(h => `<th>${h}</th>`).join('') + '</tr></thead><tbody>';
         state.rows.forEach(r => {
             const cls = r.status === 'fail' ? 'fail' : (r.status === 'skip' ? 'skip' : '');
-            const cells = [r.original, ...columns.map(column => r.results[column.key] || ''), r.note || ''];
+            const cells = [...getIdentifierValues(r), ...columns.map(column => r.results[column.key] || ''), r.note || ''];
             html += `<tr class="${cls}">` + cells.map(c => `<td>${escapeHtml(c)}</td>`).join('') + '</tr>';
         });
         html += '</tbody>';
@@ -680,10 +793,10 @@
     // ---------- 导出 Excel ----------
     function exportExcel(fields) {
         const columns = getOutputColumns(fields);
-        const head = ['申请号', ...columns.map(column => column.label)];
+        const head = [...getIdentifierHeaders(), ...columns.map(column => column.label)];
         const aoa = [head];
         state.rows.forEach(r => {
-            aoa.push([r.original, ...columns.map(column => r.results[column.key] || '')]);
+            aoa.push([...getIdentifierValues(r), ...columns.map(column => r.results[column.key] || '')]);
         });
         const ws = XLSX.utils.aoa_to_sheet(aoa);
         const wb = XLSX.utils.book_new();
@@ -703,6 +816,8 @@
     // ---------- 绑定按钮动作 ----------
     function bindActions() {
         document.getElementById('cnipa-download-tpl').onclick = downloadTemplate;
+        document.getElementById('mode-appno').onclick = () => setQueryMode('appNo');
+        document.getElementById('mode-applicant').onclick = () => setQueryMode('applicant');
 
         document.getElementById('cnipa-file').onchange = async e => {
             const file = e.target.files[0];
@@ -710,7 +825,7 @@
             if (!file) { info.textContent = ''; return; }
             try {
                 const list = await parseUpload(file);
-                info.textContent = `已读取 ${list.length} 个申请号（${file.name}）`;
+                info.textContent = `已读取 ${list.length} 个${getModeSubjectLabel()}（${file.name}）`;
                 info.dataset.appnos = JSON.stringify(list);
             } catch (err) {
                 info.textContent = `解析失败: ${err.message}`;
@@ -759,7 +874,9 @@
     // ---------- 更新按钮状态 ----------
     function updateButtons() {
         const hasRows = state.rows.length > 0;
-        const hasFailed = state.rows.some(r => r.status === 'fail');
+        const hasFailed = state.rows.some(r => r.status === 'fail' && r.cleaned);
+        document.getElementById('mode-appno').disabled = state.running;
+        document.getElementById('mode-applicant').disabled = state.running;
         // 导出：查询中且未暂停（正在跑，数据在变）时禁用；暂停或未在查询且有数据时可用
         document.getElementById('cnipa-export').disabled = !hasRows || (state.running && !state.paused);
         document.getElementById('cnipa-retry-failed').disabled = !hasFailed || state.running;
@@ -777,7 +894,7 @@
     }
 
     // ---------- 批量执行（开始查询和重查失败共用） ----------
-    async function runBatch(rowsToProcess, fields) {
+    async function runBatch(rowsToProcess, fields, processor = processRow) {
         const statusEl = document.getElementById('cnipa-status');
         const bar = document.getElementById('cnipa-progress-bar');
         state.running = true;
@@ -799,24 +916,6 @@
             statusEl.textContent = '登录态过期，已停止';
             alert('登录态已过期！\n\n请在页面上重新搜索一次，然后重新开始查询。');
         };
-        const waitWithCountdown = async (round, row, waitMs, action, skippedCount) => {
-            let remainingMs = waitMs;
-            while (remainingMs > 0 && state.running) {
-                while (state.paused && state.running) {
-                    statusEl.textContent = `已暂停（第${round}遍，${row.cleaned}，剩余 ${Math.ceil(remainingMs / 1000)} 秒）`;
-                    await sleep(200);
-                }
-                if (!state.running) return false;
-                const seconds = Math.ceil(remainingMs / 1000);
-                const skippedText = skippedCount ? `，已跳过 ${skippedCount} 个` : '';
-                statusEl.textContent = `第${round}遍：${row.cleaned} 临时风控，等待 ${seconds} 秒后${action}${skippedText}`;
-                const tickMs = Math.min(1000, remainingMs);
-                await sleep(tickMs);
-                remainingMs -= tickMs;
-            }
-            return state.running;
-        };
-
         let stopped = false;
         let round = 1;
         let roundRows = rowsToProcess.slice();
@@ -838,9 +937,9 @@
                 if (!state.running) break;
 
                 const row = roundRows[i];
-                statusEl.textContent = `第${round}遍 ${i + 1}/${total} ${row.cleaned}`;
+                statusEl.textContent = `第${round}遍 ${i + 1}/${total} ${getRowDisplayLabel(row)}`;
                 try {
-                    await processRow(row, fields);
+                    await processor(row, fields);
                     row.status = 'ok';
                     row.note = '';
                 } catch (e) {
@@ -850,12 +949,12 @@
                     } else if (e.isWaf) {
                         row.status = 'pending';
                         row.note = '临时风控，45秒后自动重试';
-                        const canRetry = await waitWithCountdown(round, row, WAF_RETRY_WAIT_MS, '重试', skippedRows.length);
+                        const canRetry = await waitWithCountdown(round, row, WAF_RETRY_WAIT_MS, '重试', skippedRows.length, statusEl);
                         if (!canRetry) {
                             stopped = true;
                         } else {
                             try {
-                                await processRow(row, fields);
+                                await processor(row, fields);
                                 row.status = 'ok';
                                 row.note = '';
                             } catch (retryError) {
@@ -866,7 +965,7 @@
                                     skippedRows.push(row);
                                     row.status = 'pending';
                                     row.note = round < WAF_MAX_ROUNDS ? '临时风控，已跳过，等待下一遍重查' : '临时风控，第二遍仍失败';
-                                    const canContinue = await waitWithCountdown(round, row, WAF_SKIP_WAIT_MS, '跳过并查找下一个', skippedRows.length);
+                                    const canContinue = await waitWithCountdown(round, row, WAF_SKIP_WAIT_MS, '跳过并查找下一个', skippedRows.length, statusEl);
                                     if (!canContinue) stopped = true;
                                 } else {
                                     row.status = 'fail';
@@ -917,6 +1016,94 @@
         updateButtons();
     }
 
+    // ---------- 按申请人查询 ----------
+    async function runApplicantQuery(rawList, fields) {
+        const statusEl = document.getElementById('cnipa-status');
+        const searchRows = rawList.map(name => ({
+            original: String(name).trim(),
+            sourceApplicant: String(name).trim(),
+            applicationNo: '',
+            cleaned: null,
+            results: {},
+            searchRecords: [],
+            status: 'pending',
+            note: ''
+        }));
+        state.rows = searchRows;
+
+        await runBatch(searchRows, fields, async row => {
+            row.searchRecords = await searchApplicantRecords(row.original);
+        });
+
+        // 如果用户在搜索阶段点击了重置，不能用旧任务结果覆盖新状态。
+        if (state.rows !== searchRows) return;
+        if (searchRows.some(row => row.note === '登录态过期')) return;
+
+        const expandedRows = [];
+        let foundCount = 0;
+        let searchFailCount = 0;
+        let noResultCount = 0;
+        searchRows.forEach(searchRow => {
+            const records = Array.isArray(searchRow.searchRecords) ? searchRow.searchRecords : [];
+            if (searchRow.status === 'fail') {
+                searchFailCount += 1;
+                expandedRows.push({
+                    original: '',
+                    sourceApplicant: searchRow.sourceApplicant,
+                    applicationNo: '',
+                    cleaned: null,
+                    results: {},
+                    status: 'fail',
+                    note: searchRow.note || '申请人搜索失败'
+                });
+                return;
+            }
+            if (!records.length) {
+                noResultCount += 1;
+                expandedRows.push({
+                    original: '',
+                    sourceApplicant: searchRow.sourceApplicant,
+                    applicationNo: '',
+                    cleaned: null,
+                    results: {},
+                    status: 'skip',
+                    note: '未找到申请号'
+                });
+                return;
+            }
+            records.forEach(record => {
+                const applicationNo = record && record.zhuanlisqh != null ? String(record.zhuanlisqh).trim() : '';
+                const cleaned = normalizeAppNo(applicationNo);
+                if (cleaned) foundCount += 1;
+                expandedRows.push({
+                    original: applicationNo,
+                    sourceApplicant: searchRow.sourceApplicant,
+                    applicationNo,
+                    cleaned,
+                    results: {},
+                    status: cleaned ? 'pending' : 'skip',
+                    note: cleaned ? '' : '搜索结果中的申请号格式无法识别'
+                });
+            });
+        });
+
+        state.rows = expandedRows;
+        renderOutput(fields);
+        const toProcess = expandedRows.filter(row => row.status === 'pending' && row.cleaned);
+        if (!toProcess.length) {
+            state.running = false;
+            updateButtons();
+            statusEl.textContent = `申请人查询完成，共找到 ${foundCount} 个申请号` + (noResultCount ? `，${noResultCount} 个申请人未找到结果` : '');
+            return;
+        }
+
+        statusEl.textContent = `申请人检索完成，共找到 ${foundCount} 个申请号，开始抓取详细信息`;
+        await runBatch(toProcess, fields);
+        if (searchFailCount && state.rows === expandedRows) {
+            statusEl.textContent += `；另有 ${searchFailCount} 个申请人搜索失败`;
+        }
+    }
+
     // ---------- 开始查询 ----------
     async function startQuery() {
         // 运行中且未暂停：不允许；暂停中：停止旧任务，用当前输入源重新开始
@@ -935,7 +1122,7 @@
             return;
         }
 
-        // 收集申请号
+        // 收集当前模式的输入
         let rawList = [];
         const uploadInfo = document.getElementById('cnipa-file-info');
         const uploadActive = document.getElementById('pane-upload').style.display !== 'none';
@@ -944,10 +1131,15 @@
             rawList = JSON.parse(uploadInfo.dataset.appnos);
         } else {
             const input = document.getElementById('cnipa-input').innerText.trim();
-            if (!input) { alert('请先粘贴申请号'); return; }
+            if (!input) { alert(`请先粘贴${getModeSubjectLabel()}`); return; }
             rawList = input.split('\n').map(s => s.trim()).filter(Boolean);
         }
-        if (!rawList.length) { alert('没有有效的申请号'); return; }
+        if (!rawList.length) { alert(`没有有效的${getModeSubjectLabel()}`); return; }
+
+        if (state.queryMode === 'applicant') {
+            await runApplicantQuery(rawList, fields);
+            return;
+        }
 
         // 构建行
         state.rows = rawList.map(orig => {
@@ -984,13 +1176,19 @@
         }
         // 重置所有行为 pending（skip 的格式错误行保持 skip）
         state.rows.forEach(r => {
-            if (r.status !== 'skip') {
+            if (r.cleaned) {
                 r.status = 'pending';
                 r.results = {};
                 r.note = '';
             }
         });
-        const toProcess = state.rows.filter(r => r.status === 'pending');
+        const toProcess = state.rows.filter(r => r.status === 'pending' && r.cleaned);
+        if (!toProcess.length) {
+            renderOutput(fields);
+            updateButtons();
+            document.getElementById('cnipa-status').textContent = '没有可重新开始的有效申请号';
+            return;
+        }
         await runBatch(toProcess, fields);
     }
 
@@ -1029,7 +1227,7 @@
             alert('还没有获取到登录态！\n\n请先在页面上手动搜索一次，等面板顶部变成"✅ 登录态已获取"后再点。');
             return;
         }
-        const failedRows = state.rows.filter(r => r.status === 'fail');
+        const failedRows = state.rows.filter(r => r.status === 'fail' && r.cleaned);
         if (!failedRows.length) { alert('没有失败项需要重查'); return; }
         await runBatch(failedRows, fields);
     }
