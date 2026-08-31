@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CNIPA 专利信息批量查询
 // @namespace    http://tampermonkey.net/
-// @version      1.15
+// @version      1.16
 // @description  国知局专利信息批量查询：申请人/代理机构/最近缴费人/最近缴费种类/最近缴费金额/最近缴费日期/法律状态/案件状态/应缴费信息/应缴滞纳金信息，支持 Excel 上传导出、失败重查
 // @author       CNIPA_Fee_Collector
 // @license      MIT
@@ -59,6 +59,346 @@
             return origFetch.apply(this, arguments);
         };
     })();
+
+    // ---------- 临时风控恢复页通信 ----------
+    const RECOVERY_MESSAGE_SOURCE = 'cnipa-userscript-recovery';
+    const RECOVERY_WORKER_PREFIX = 'cnipa-recovery-worker:';
+    const RECOVERY_PAGE_TIMEOUT_MS = 30000;
+    const RECOVERY_API_TIMEOUT_MS = 60000;
+    const RECOVERY_FALLBACK_SEARCH_VALUE = '1111111111111';
+    const isRecoveryWorker = location.hash.startsWith('#' + RECOVERY_WORKER_PREFIX);
+    let recoverySessionId = isRecoveryWorker
+        ? decodeURIComponent(location.hash.slice(1 + RECOVERY_WORKER_PREFIX.length))
+        : '';
+    let recoveryWorkerWindow = null;
+    let recoveryReservedWindow = null;
+    let recoveryWorkerPageReady = false;
+    let recoveryWorkerReady = false;
+    let recoveryOpenPromise = null;
+    let recoveryReadyWaiter = null;
+    let recoverySearchWaiter = null;
+    let recoveryRequestSeq = 0;
+    let recoveryWorkerSearchRunning = false;
+    const recoveryPendingRequests = new Map();
+
+    function makeRecoveryError(message, isWaf = false, httpStatus = null) {
+        const error = new Error(message);
+        if (isWaf) error.isWaf = true;
+        if (httpStatus != null) error.httpStatus = httpStatus;
+        return error;
+    }
+
+    function serializeRecoveryError(error) {
+        return {
+            message: error && error.message ? error.message : '新标签页请求失败',
+            isWaf: Boolean(error && error.isWaf),
+            httpStatus: error && error.httpStatus != null ? error.httpStatus : null
+        };
+    }
+
+    function reviveRecoveryError(data) {
+        const error = makeRecoveryError(data && data.message ? data.message : '新标签页请求失败', Boolean(data && data.isWaf), data && data.httpStatus);
+        return error;
+    }
+
+    function findNativeSearchButton() {
+        return Array.from(document.querySelectorAll('button')).find(button => {
+            const text = String(button.innerText || button.textContent || '').replace(/\s+/g, '');
+            return text.endsWith('查询') && !text.includes('开始') && !text.includes('重查') && !button.disabled;
+        });
+    }
+
+    async function waitForRecoverySearchForm(timeoutMs = RECOVERY_PAGE_TIMEOUT_MS) {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            const input = document.querySelector('input[placeholder="例如: 2010101995057"]');
+            const searchButton = findNativeSearchButton();
+            if (input && searchButton) return { input, searchButton };
+            await sleep(200);
+        }
+        throw makeRecoveryError('新标签页查询页面加载超时', true);
+    }
+
+    function setNativeSearchValue(input, value) {
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+        input.focus();
+        setter.call(input, '');
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        setter.call(input, value);
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        input.dispatchEvent(new Event('blur', { bubbles: true }));
+    }
+
+    async function waitForRecoveryAuth(timeoutMs = RECOVERY_PAGE_TIMEOUT_MS) {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            if (window.__cnipaAuth.token) return true;
+            await sleep(200);
+        }
+        return false;
+    }
+
+    function postRecoveryToMain(message) {
+        if (!window.opener || window.opener.closed) return false;
+        try {
+            window.opener.postMessage({
+                source: RECOVERY_MESSAGE_SOURCE,
+                sessionId: recoverySessionId,
+                ...message
+            }, location.origin);
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function postRecoveryToWorker(message) {
+        if (!recoveryWorkerWindow || recoveryWorkerWindow.closed) return false;
+        try {
+            recoveryWorkerWindow.postMessage({
+                source: RECOVERY_MESSAGE_SOURCE,
+                sessionId: recoverySessionId,
+                ...message
+            }, location.origin);
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function isRecoveryWindowOpen(target) {
+        try {
+            return Boolean(target && !target.closed);
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function reserveRecoveryWindow() {
+        if (isRecoveryWorker || isRecoveryWindowOpen(recoveryWorkerWindow) || isRecoveryWindowOpen(recoveryReservedWindow)) return;
+        try {
+            recoveryReservedWindow = window.open('about:blank', '_blank');
+        } catch (e) {
+            recoveryReservedWindow = null;
+        }
+    }
+
+    function releaseRecoveryReservation() {
+        if (recoveryReservedWindow) {
+            try {
+                if (!recoveryReservedWindow.closed) recoveryReservedWindow.close();
+            } catch (e) {}
+        }
+        recoveryReservedWindow = null;
+    }
+
+    function settleRecoveryWaiter(waiter, error, value) {
+        if (!waiter) return;
+        clearTimeout(waiter.timeoutId);
+        if (error) waiter.reject(error);
+        else waiter.resolve(value);
+    }
+
+    function abandonRecoveryWorker(reason = '新标签页恢复已结束') {
+        const error = makeRecoveryError(reason, true);
+        settleRecoveryWaiter(recoveryReadyWaiter, error);
+        settleRecoveryWaiter(recoverySearchWaiter, error);
+        recoveryReadyWaiter = null;
+        recoverySearchWaiter = null;
+        recoveryPendingRequests.forEach(waiter => settleRecoveryWaiter(waiter, error));
+        recoveryPendingRequests.clear();
+        if (recoveryWorkerWindow) {
+            try { recoveryWorkerWindow.close(); } catch (e) {}
+        }
+        recoveryWorkerWindow = null;
+        recoveryWorkerPageReady = false;
+        recoveryWorkerReady = false;
+        recoverySessionId = '';
+    }
+
+    function handleMainRecoveryMessage(data) {
+        if (!data || data.sessionId !== recoverySessionId) return;
+        if (data.type === 'worker-ready') {
+            const waiter = recoveryReadyWaiter;
+            recoveryReadyWaiter = null;
+            if (!waiter) return;
+            if (data.ok) {
+                recoveryWorkerPageReady = true;
+                settleRecoveryWaiter(waiter, null, true);
+            } else {
+                settleRecoveryWaiter(waiter, reviveRecoveryError(data.error || {}));
+            }
+            return;
+        }
+        if (data.type === 'search-result') {
+            const waiter = recoverySearchWaiter;
+            recoverySearchWaiter = null;
+            if (!waiter) return;
+            if (data.ok) settleRecoveryWaiter(waiter, null, true);
+            else settleRecoveryWaiter(waiter, reviveRecoveryError(data.error || {}));
+            return;
+        }
+        if (data.type === 'api-result') {
+            const waiter = recoveryPendingRequests.get(data.requestId);
+            if (!waiter) return;
+            recoveryPendingRequests.delete(data.requestId);
+            if (data.ok) settleRecoveryWaiter(waiter, null, data.data);
+            else settleRecoveryWaiter(waiter, reviveRecoveryError(data.error || {}));
+        }
+    }
+
+    function handleRecoveryWorkerMessage(data) {
+        if (!data || data.sessionId !== recoverySessionId) return;
+        if (data.type === 'search') {
+            if (recoveryWorkerSearchRunning) return;
+            recoveryWorkerSearchRunning = true;
+            (async () => {
+                try {
+                    const { input, searchButton } = await waitForRecoverySearchForm();
+                    setNativeSearchValue(input, String(data.applicationNo || ''));
+                    await sleep(100);
+                    searchButton.click();
+                    if (!await waitForRecoveryAuth()) throw makeRecoveryError('新标签页未捕获到登录态', true);
+                    await sleep(500);
+                    postRecoveryToMain({ type: 'search-result', ok: true });
+                } catch (error) {
+                    postRecoveryToMain({ type: 'search-result', ok: false, error: serializeRecoveryError(error) });
+                } finally {
+                    recoveryWorkerSearchRunning = false;
+                }
+            })();
+            return;
+        }
+        if (data.type === 'api') {
+            (async () => {
+                try {
+                    const result = await callApi(data.apiKey, data.payload);
+                    postRecoveryToMain({ type: 'api-result', requestId: data.requestId, ok: true, data: result });
+                } catch (error) {
+                    postRecoveryToMain({ type: 'api-result', requestId: data.requestId, ok: false, error: serializeRecoveryError(error) });
+                }
+            })();
+        }
+    }
+
+    function handleRecoveryMessage(event) {
+        if (event.origin !== location.origin) return;
+        const data = event.data || {};
+        if (data.source !== RECOVERY_MESSAGE_SOURCE) return;
+        if (isRecoveryWorker) handleRecoveryWorkerMessage(data);
+        else handleMainRecoveryMessage(data);
+    }
+
+    async function openRecoveryWorker() {
+        const sessionId = 'r' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        recoverySessionId = sessionId;
+        return new Promise((resolve, reject) => {
+            const timeoutId = setTimeout(() => {
+                if (recoveryReadyWaiter && recoveryReadyWaiter.sessionId === sessionId) {
+                    recoveryReadyWaiter = null;
+                    abandonRecoveryWorker('新标签页未能恢复页面状态');
+                    reject(makeRecoveryError('新标签页未能恢复页面状态', true));
+                }
+            }, RECOVERY_PAGE_TIMEOUT_MS);
+            recoveryReadyWaiter = { resolve, reject, timeoutId, sessionId };
+            const recoveryUrl = new URL(location.href);
+            recoveryUrl.hash = '#' + RECOVERY_WORKER_PREFIX + encodeURIComponent(sessionId);
+            let opened = null;
+            if (isRecoveryWindowOpen(recoveryReservedWindow)) {
+                opened = recoveryReservedWindow;
+                recoveryReservedWindow = null;
+                recoveryWorkerWindow = opened;
+                opened.location.href = recoveryUrl.href;
+            } else {
+                recoveryReservedWindow = null;
+                opened = window.open(recoveryUrl.href, '_blank');
+            }
+            if (!opened) {
+                clearTimeout(timeoutId);
+                recoveryReadyWaiter = null;
+                abandonRecoveryWorker('浏览器阻止了新标签页');
+                reject(makeRecoveryError('浏览器阻止了新标签页', true));
+                return;
+            }
+            recoveryWorkerWindow = opened;
+        });
+    }
+
+    function sendRecoverySearch(applicationNo) {
+        if (!recoveryWorkerPageReady) return Promise.reject(makeRecoveryError('新标签页尚未准备好', true));
+        return new Promise((resolve, reject) => {
+            const timeoutId = setTimeout(() => {
+                if (recoverySearchWaiter) {
+                    recoverySearchWaiter = null;
+                    reject(makeRecoveryError('新标签页页面查询超时', true));
+                }
+            }, RECOVERY_PAGE_TIMEOUT_MS);
+            recoverySearchWaiter = { resolve, reject, timeoutId };
+            if (!postRecoveryToWorker({ type: 'search', applicationNo })) {
+                recoverySearchWaiter = null;
+                clearTimeout(timeoutId);
+                reject(makeRecoveryError('无法向新标签页发送查询', true));
+            }
+        });
+    }
+
+    async function recoverWithFreshPage(applicationNo, forceFresh = false) {
+        if (forceFresh) abandonRecoveryWorker('重新建立风控恢复页');
+        if (recoveryWorkerReady && !forceFresh) return true;
+        try {
+            if (!recoveryOpenPromise) {
+                recoveryOpenPromise = openRecoveryWorker().finally(() => { recoveryOpenPromise = null; });
+            }
+            await recoveryOpenPromise;
+            await sendRecoverySearch(applicationNo);
+            recoveryWorkerReady = true;
+            return true;
+        } catch (error) {
+            abandonRecoveryWorker('新标签页恢复失败');
+            throw error;
+        }
+    }
+
+    function callApiThroughRecoveryWorker(apiKey, payload) {
+        if (!recoveryWorkerReady) throw makeRecoveryError('新标签页登录态尚未准备好', true);
+        const requestId = recoverySessionId + '-' + (++recoveryRequestSeq);
+        return new Promise((resolve, reject) => {
+            const timeoutId = setTimeout(() => {
+                const waiter = recoveryPendingRequests.get(requestId);
+                if (!waiter) return;
+                recoveryPendingRequests.delete(requestId);
+                reject(makeRecoveryError('新标签页接口请求超时', true));
+            }, RECOVERY_API_TIMEOUT_MS);
+            recoveryPendingRequests.set(requestId, { resolve, reject, timeoutId });
+            if (!postRecoveryToWorker({ type: 'api', requestId, apiKey, payload })) {
+                recoveryPendingRequests.delete(requestId);
+                clearTimeout(timeoutId);
+                reject(makeRecoveryError('新标签页已关闭', true));
+            }
+        });
+    }
+
+    function setupRecoveryWorker() {
+        const announceReady = async () => {
+            try {
+                await waitForRecoverySearchForm();
+                postRecoveryToMain({ type: 'worker-ready', ok: true });
+            } catch (error) {
+                postRecoveryToMain({ type: 'worker-ready', ok: false, error: serializeRecoveryError(error) });
+            }
+        };
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', announceReady, { once: true });
+        } else {
+            announceReady();
+        }
+    }
+
+    function releaseRecoveryPages(reason = '批量查询结束') {
+        if (recoveryWorkerWindow) abandonRecoveryWorker(reason);
+        releaseRecoveryReservation();
+    }
 
     // ---------- 申请号格式清洗 ----------
     function normalizeAppNo(raw) {
@@ -230,6 +570,7 @@
 
     // ---------- 更新日志（新版本追加到最前面） ----------
     const CHANGELOG = [
+        { version: '1.16', date: '2026-08-31', items: ['临时风控时自动新建 CNIPA 标签页，自动填入当前申请号并触发页面查询；恢复成功后在新标签页继续抓取，恢复失败时保留原有自动等待和第二遍重查'] },
         { version: '1.15', date: '2026-08-31', items: ['新增“按申请号查询”和“按申请人查询”模式切换；按申请人查询时先获取该申请人的申请号，再批量抓取勾选字段'] },
         { version: '1.14', date: '2026-08-31', items: ['新增“应缴费信息”和“应缴滞纳金信息”两个可选查询项目，各自抓取第一条，并在结果预览和 Excel 中展开为四列'] },
         { version: '1.13', date: '2026-08-28', items: ['调整临时风控处理：单号首次等待45秒重试，仍失败等待30秒后跳过；本轮完成后自动进行第二遍重查，第二遍仍失败则保留失败项'] },
@@ -254,7 +595,7 @@
         panel.id = 'cnipa-panel';
         panel.innerHTML = `
             <div id="cnipa-header">
-                <b>CNIPA 专利信息批量查询 v1.15</b>
+                <b>CNIPA 专利信息批量查询 v1.16</b>
                 <span id="cnipa-header-btns">
                     <span id="cnipa-changelog-btn" title="更新日志">ⓘ</span>
                     <span id="cnipa-collapse">—</span>
@@ -652,6 +993,9 @@
 
     // ---------- 调 API（带重试） ----------
     async function callApi(apiKey, payload, retryCount = 0) {
+        if (!isRecoveryWorker && recoveryWorkerReady) {
+            return callApiThroughRecoveryWorker(apiKey, payload);
+        }
         const auth = window.__cnipaAuth;
         if (!auth.token) throw new Error('no-auth');
         try {
@@ -686,7 +1030,7 @@
             if (e.isWaf) throw e;
             if (retryCount === 0) {
                 await sleep(1500);
-                return callApi(apiKey, appNo, retryCount + 1);
+                return callApi(apiKey, payload, retryCount + 1);
             }
             throw e;
         }
@@ -948,28 +1292,54 @@
                         stopped = true;
                     } else if (e.isWaf) {
                         row.status = 'pending';
-                        row.note = '临时风控，45秒后自动重试';
-                        const canRetry = await waitWithCountdown(round, row, WAF_RETRY_WAIT_MS, '重试', skippedRows.length, statusEl);
-                        if (!canRetry) {
-                            stopped = true;
-                        } else {
-                            try {
+                        let fallbackToCooldown = true;
+                        try {
+                            statusEl.textContent = `第${round}遍：${getRowDisplayLabel(row)} 临时风控，正在新建标签页恢复页面状态`;
+                            await recoverWithFreshPage(row.cleaned || RECOVERY_FALLBACK_SEARCH_VALUE, recoveryWorkerReady);
+                            if (!state.running) {
+                                stopped = true;
+                            } else {
+                                statusEl.textContent = `第${round}遍：${getRowDisplayLabel(row)} 新标签页已恢复，重试当前申请号`;
                                 await processor(row, fields);
                                 row.status = 'ok';
                                 row.note = '';
-                            } catch (retryError) {
-                                if (isAuthError(retryError)) {
-                                    stopForAuth(row);
-                                    stopped = true;
-                                } else if (retryError.isWaf) {
-                                    skippedRows.push(row);
-                                    row.status = 'pending';
-                                    row.note = round < WAF_MAX_ROUNDS ? '临时风控，已跳过，等待下一遍重查' : '临时风控，第二遍仍失败';
-                                    const canContinue = await waitWithCountdown(round, row, WAF_SKIP_WAIT_MS, '跳过并查找下一个', skippedRows.length, statusEl);
-                                    if (!canContinue) stopped = true;
-                                } else {
-                                    row.status = 'fail';
-                                    row.note = retryError.message;
+                                fallbackToCooldown = false;
+                            }
+                        } catch (recoveryError) {
+                            if (isAuthError(recoveryError)) {
+                                stopForAuth(row);
+                                stopped = true;
+                                fallbackToCooldown = false;
+                            } else if (!recoveryError.isWaf) {
+                                row.status = 'fail';
+                                row.note = recoveryError.message;
+                                fallbackToCooldown = false;
+                            }
+                        }
+                        if (fallbackToCooldown && !stopped) {
+                            row.note = '临时风控，新标签页恢复失败，45秒后自动重试';
+                            const canRetry = await waitWithCountdown(round, row, WAF_RETRY_WAIT_MS, '重试', skippedRows.length, statusEl);
+                            if (!canRetry) {
+                                stopped = true;
+                            } else {
+                                try {
+                                    await processor(row, fields);
+                                    row.status = 'ok';
+                                    row.note = '';
+                                } catch (retryError) {
+                                    if (isAuthError(retryError)) {
+                                        stopForAuth(row);
+                                        stopped = true;
+                                    } else if (retryError.isWaf) {
+                                        skippedRows.push(row);
+                                        row.status = 'pending';
+                                        row.note = round < WAF_MAX_ROUNDS ? '临时风控，已跳过，等待下一遍重查' : '临时风控，第二遍仍失败';
+                                        const canContinue = await waitWithCountdown(round, row, WAF_SKIP_WAIT_MS, '跳过并查找下一个', skippedRows.length, statusEl);
+                                        if (!canContinue) stopped = true;
+                                    } else {
+                                        row.status = 'fail';
+                                        row.note = retryError.message;
+                                    }
                                 }
                             }
                         }
@@ -1014,6 +1384,15 @@
         }
         state.running = false;
         updateButtons();
+    }
+
+    async function runWithRecoveryReservation(task) {
+        reserveRecoveryWindow();
+        try {
+            return await task();
+        } finally {
+            if (!state.running) releaseRecoveryPages();
+        }
     }
 
     // ---------- 按申请人查询 ----------
@@ -1137,7 +1516,7 @@
         if (!rawList.length) { alert(`没有有效的${getModeSubjectLabel()}`); return; }
 
         if (state.queryMode === 'applicant') {
-            await runApplicantQuery(rawList, fields);
+            await runWithRecoveryReservation(() => runApplicantQuery(rawList, fields));
             return;
         }
 
@@ -1155,7 +1534,7 @@
 
         // 只处理状态为 pending 的（skip 的格式错误行不查）
         const toProcess = state.rows.filter(r => r.status === 'pending');
-        await runBatch(toProcess, fields);
+        await runWithRecoveryReservation(() => runBatch(toProcess, fields));
     }
 
     // ---------- 重新开始（整体重来当前批次） ----------
@@ -1189,7 +1568,7 @@
             document.getElementById('cnipa-status').textContent = '没有可重新开始的有效申请号';
             return;
         }
-        await runBatch(toProcess, fields);
+        await runWithRecoveryReservation(() => runBatch(toProcess, fields));
     }
 
     // ---------- 重置面板（保留登录态） ----------
@@ -1229,10 +1608,13 @@
         }
         const failedRows = state.rows.filter(r => r.status === 'fail' && r.cleaned);
         if (!failedRows.length) { alert('没有失败项需要重查'); return; }
-        await runBatch(failedRows, fields);
+        await runWithRecoveryReservation(() => runBatch(failedRows, fields));
     }
 
-    if (document.readyState === 'loading') {
+    window.addEventListener('message', handleRecoveryMessage);
+    if (isRecoveryWorker) {
+        setupRecoveryWorker();
+    } else if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', init);
     } else {
         init();
