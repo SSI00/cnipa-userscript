@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         CNIPA 专利信息批量查询
 // @namespace    http://tampermonkey.net/
-// @version      1.13
-// @description  国知局专利信息批量查询：申请人/代理机构/最近缴费人/最近缴费种类/最近缴费金额/最近缴费日期/法律状态/案件状态，支持 Excel 上传导出、失败重查
+// @version      1.14
+// @description  国知局专利信息批量查询：申请人/代理机构/最近缴费人/最近缴费种类/最近缴费金额/最近缴费日期/法律状态/案件状态/应缴费信息/应缴滞纳金信息，支持 Excel 上传导出、失败重查
 // @author       CNIPA_Fee_Collector
 // @license      MIT
 // @homepageURL  https://github.com/SSI00/cnipa-userscript
@@ -120,6 +120,46 @@
                 return (list && list.length) ? String(list[0].yijiaofjfrq || '').trim() : '';
             }
         },
+        dueFee: {
+            label: '应缴费信息',
+            api: 'fyxx',
+            columns: [
+                { key: 'dueFeeType', label: '应缴费信息-费用种类', source: 'yingjiaoffyzlmc' },
+                { key: 'dueFeeAmount', label: '应缴费信息-费用金额', source: 'yingjiaoje' },
+                { key: 'dueFeeDeadline', label: '应缴费信息-缴费截止日', source: 'jiaofeijzr' },
+                { key: 'dueFeeStatus', label: '应缴费信息-费用状态', source: 'yingjiaoffyzt' }
+            ],
+            extract(data) {
+                const section = data.data && data.data.yingjiaofei;
+                const list = section && section.svYingjfList;
+                const first = list && list.length ? list[0] : null;
+                return this.columns.reduce((result, column) => {
+                    const value = first && first[column.source];
+                    result[column.key] = value == null ? '' : String(value).trim();
+                    return result;
+                }, {});
+            }
+        },
+        lateFee: {
+            label: '应缴滞纳金信息',
+            api: 'fyxx',
+            columns: [
+                { key: 'lateFeeTime', label: '应缴滞纳金信息-缴费时间', source: 'zhinajjfsj' },
+                { key: 'lateFeeAnnualAmount', label: '应缴滞纳金信息-当前年费金额', source: 'zhinajdqnfje' },
+                { key: 'lateFeePenalty', label: '应缴滞纳金信息-应缴滞纳金额', source: 'zhinajyjznje' },
+                { key: 'lateFeeTotal', label: '应缴滞纳金信息-总计', source: 'zhinajzj' }
+            ],
+            extract(data) {
+                const section = data.data && data.data.zhinajin;
+                const list = section && section.svZnjList;
+                const first = list && list.length ? list[0] : null;
+                return this.columns.reduce((result, column) => {
+                    const value = first && first[column.source];
+                    result[column.key] = value == null ? '' : String(value).trim();
+                    return result;
+                }, {});
+            }
+        },
         legalStatus: {
             label: '法律状态',
             api: 'sqxx',
@@ -141,7 +181,7 @@
             }
         }
     };
-    const FIELD_ORDER_DEFAULT = ['applicant', 'agency', 'payer', 'feeType', 'feeAmount', 'feeDate', 'legalStatus', 'caseStatus'];
+    const FIELD_ORDER_DEFAULT = ['applicant', 'agency', 'payer', 'feeType', 'feeAmount', 'feeDate', 'legalStatus', 'caseStatus', 'dueFee', 'lateFee'];
 
     // ---------- 全局状态 ----------
     const state = {
@@ -188,6 +228,7 @@
 
     // ---------- 更新日志（新版本追加到最前面） ----------
     const CHANGELOG = [
+        { version: '1.14', date: '2026-08-31', items: ['新增“应缴费信息”和“应缴滞纳金信息”两个可选查询项目，各自抓取第一条，并在结果预览和 Excel 中展开为四列'] },
         { version: '1.13', date: '2026-08-28', items: ['调整临时风控处理：单号首次等待45秒重试，仍失败等待30秒后跳过；本轮完成后自动进行第二遍重查，第二遍仍失败则保留失败项'] },
         { version: '1.12', date: '2026-08-28', items: ['新增最近缴费金额和最近缴费日期查询字段，并支持结果预览和 Excel 导出'] },
         { version: '1.11', date: '2026-08-27', items: ['去掉查询窗口最外围边框，保留内部白色背景、圆角和阴影'] },
@@ -425,6 +466,13 @@
         return state.fieldOrder.filter(k => state.checked.has(k));
     }
 
+    function getOutputColumns(fields) {
+        return fields.flatMap(fieldKey => {
+            const field = FIELDS[fieldKey];
+            return field.columns || [{ key: fieldKey, label: field.label }];
+        });
+    }
+
     // ---------- 输入方式切换 ----------
     function bindTabs() {
         const tp = document.getElementById('tab-paste');
@@ -588,11 +636,24 @@
         if (needSqxx) sqxxData = await callApi('sqxx', row.cleaned);
         if (needFyxx) fyxxData = await callApi('fyxx', row.cleaned);
         fields.forEach(f => {
-            const src = FIELDS[f].api === 'sqxx' ? sqxxData : fyxxData;
+            const field = FIELDS[f];
+            const src = field.api === 'sqxx' ? sqxxData : fyxxData;
             try {
-                row.results[f] = src ? FIELDS[f].extract(src) : '';
+                const extracted = src ? field.extract(src) : '';
+                if (field.columns) {
+                    field.columns.forEach(column => {
+                        const value = extracted && extracted[column.key];
+                        row.results[column.key] = value == null ? '' : value;
+                    });
+                } else {
+                    row.results[f] = extracted;
+                }
             } catch (e) {
-                row.results[f] = '';
+                if (field.columns) {
+                    field.columns.forEach(column => { row.results[column.key] = ''; });
+                } else {
+                    row.results[f] = '';
+                }
             }
         });
     }
@@ -600,11 +661,12 @@
     // ---------- 渲染结果表格 ----------
     function renderOutput(fields) {
         const table = document.getElementById('cnipa-output');
-        const head = ['申请号', ...fields.map(f => FIELDS[f].label), '备注'];
+        const columns = getOutputColumns(fields);
+        const head = ['申请号', ...columns.map(column => column.label), '备注'];
         let html = '<thead><tr>' + head.map(h => `<th>${h}</th>`).join('') + '</tr></thead><tbody>';
         state.rows.forEach(r => {
             const cls = r.status === 'fail' ? 'fail' : (r.status === 'skip' ? 'skip' : '');
-            const cells = [r.original, ...fields.map(f => r.results[f] || ''), r.note || ''];
+            const cells = [r.original, ...columns.map(column => r.results[column.key] || ''), r.note || ''];
             html += `<tr class="${cls}">` + cells.map(c => `<td>${escapeHtml(c)}</td>`).join('') + '</tr>';
         });
         html += '</tbody>';
@@ -617,10 +679,11 @@
 
     // ---------- 导出 Excel ----------
     function exportExcel(fields) {
-        const head = ['申请号', ...fields.map(f => FIELDS[f].label)];
+        const columns = getOutputColumns(fields);
+        const head = ['申请号', ...columns.map(column => column.label)];
         const aoa = [head];
         state.rows.forEach(r => {
-            aoa.push([r.original, ...fields.map(f => r.results[f] || '')]);
+            aoa.push([r.original, ...columns.map(column => r.results[column.key] || '')]);
         });
         const ws = XLSX.utils.aoa_to_sheet(aoa);
         const wb = XLSX.utils.book_new();
