@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CNIPA 专利信息批量查询
 // @namespace    http://tampermonkey.net/
-// @version      1.16.1
+// @version      1.16.2
 // @description  国知局专利信息批量查询：申请人/代理机构/最近缴费人/最近缴费种类/最近缴费金额/最近缴费日期/法律状态/案件状态/应缴费信息/应缴滞纳金信息，支持 Excel 上传导出、失败重查
 // @author       CNIPA_Fee_Collector
 // @license      MIT
@@ -200,8 +200,8 @@
     };
 
     // ---------- 接口随机等待 ----------
-    const API_REQUEST_MIN_INTERVAL_MS = 1200;
-    const API_REQUEST_MAX_INTERVAL_MS = 3000;
+    const API_REQUEST_MIN_INTERVAL_MS = 1800;
+    const API_REQUEST_MAX_INTERVAL_MS = 2500;
     const MAX_RETRY_ROUNDS = 2;
     let lastApiRequestAt = 0;
 
@@ -224,6 +224,7 @@
 
     // ---------- 更新日志（新版本追加到最前面） ----------
     const CHANGELOG = [
+        { version: '1.16.2', date: '2026-08-31', items: ['将接口随机等待调整为 1.8～2.5 秒，继续取消分批冷却，并在首轮完成后自动重试失败项一次'] },
         { version: '1.16.1', date: '2026-08-31', items: ['取消临时风控时的新标签页跳转；接口改为 1.2～3 秒随机间隔，不再分批冷却；首轮全部完成后自动重试失败项一次'] },
         { version: '1.16', date: '2026-08-31', items: ['临时风控时自动新建 CNIPA 标签页，自动填入当前申请号并触发页面查询；恢复成功后在新标签页继续抓取，恢复失败时保留原有自动等待和第二遍重查'] },
         { version: '1.15', date: '2026-08-31', items: ['新增“按申请号查询”和“按申请人查询”模式切换；按申请人查询时先获取该申请人的申请号，再批量抓取勾选字段'] },
@@ -250,7 +251,7 @@
         panel.id = 'cnipa-panel';
         panel.innerHTML = `
             <div id="cnipa-header">
-                <b>CNIPA 专利信息批量查询 v1.16.1</b>
+                <b>CNIPA 专利信息批量查询 v1.16.2</b>
                 <span id="cnipa-header-btns">
                     <span id="cnipa-changelog-btn" title="更新日志">ⓘ</span>
                     <span id="cnipa-collapse">—</span>
