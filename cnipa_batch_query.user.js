@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CNIPA 专利信息批量查询
 // @namespace    http://tampermonkey.net/
-// @version      1.15
+// @version      1.14
 // @description  国知局专利信息批量查询：申请人/代理机构/最近缴费人/最近缴费种类/最近缴费金额/最近缴费日期/法律状态/案件状态/应缴费信息/应缴滞纳金信息，支持 Excel 上传导出、失败重查
 // @author       CNIPA_Fee_Collector
 // @license      MIT
@@ -228,7 +228,6 @@
 
     // ---------- 更新日志（新版本追加到最前面） ----------
     const CHANGELOG = [
-        { version: '1.15', date: '2026-08-31', items: ['修正标题栏版本号显示'] },
         { version: '1.14', date: '2026-08-31', items: ['新增“应缴费信息”和“应缴滞纳金信息”两个可选查询项目，各自抓取第一条，并在结果预览和 Excel 中展开为四列'] },
         { version: '1.13', date: '2026-08-28', items: ['调整临时风控处理：单号首次等待45秒重试，仍失败等待30秒后跳过；本轮完成后自动进行第二遍重查，第二遍仍失败则保留失败项'] },
         { version: '1.12', date: '2026-08-28', items: ['新增最近缴费金额和最近缴费日期查询字段，并支持结果预览和 Excel 导出'] },
@@ -252,7 +251,7 @@
         panel.id = 'cnipa-panel';
         panel.innerHTML = `
             <div id="cnipa-header">
-                <b>CNIPA 专利信息批量查询 v1.15</b>
+                <b>CNIPA 专利信息批量查询 v1.14</b>
                 <span id="cnipa-header-btns">
                     <span id="cnipa-changelog-btn" title="更新日志">ⓘ</span>
                     <span id="cnipa-collapse">—</span>
